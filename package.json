@@ -1,0 +1,23 @@
+{
+  "name": "dsh-echochat-plugin",
+  "version": "0.1.0",
+  "description": "DSH 工具 echo_judge：用 EchoChat 的级联门控 + 步骤级信用分配(SDCA) 给共情回应候选排序并定位该重做哪一步；打分走引擎自己的 ctx.llm，不需要 API key",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": ["index.mjs", "vendor/", "cordis.patch.yml", "README.md", "LICENSE"],
+  "dsh": {
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "capabilities": ["tools:register", "network:egress"],
+    "labels": []
+  },
+  "keywords": ["dsh", "deepseek-harness", "plugin", "empathy", "echochat", "sdca", "reward-gating"],
+  "repository": { "type": "git", "url": "git+https://github.com/Verchiel666/dsh-echochat-plugin.git" },
+  "homepage": "https://github.com/Verchiel666/dsh-echochat-plugin",
+  "bugs": "https://github.com/Verchiel666/dsh-echochat-plugin/issues",
+  "license": "MIT"
+}

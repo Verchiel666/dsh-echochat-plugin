@@ -1,0 +1,10 @@
+# 把下面这一整个 entry 追加到 $DSH_HOME/profiles/android/cordis.patch.yml 末尾，然后重启引擎。
+# name 必须是字面绝对路径（!!js 只在 config 里求值，写进 name 会让引擎起不来）。
+- insert:
+    - id: echochat
+      name: /data/user/0/io.github.jackwener.dsh/files/home/work/echochat-plugin/index.mjs
+      config:
+        provider: deepseek-account
+        model: deepseek-flash
+        tau: 0.6
+        maxTokens: 900

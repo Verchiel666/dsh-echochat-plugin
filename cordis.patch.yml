@@ -1,0 +1,12 @@
+# 把本插件插进 profile 的层栈。App 里安装后重启引擎生效。
+# name 用包名（本机 pnpm 装好后由 Loader 解析），不要写 !!js。
+- insert:
+    - id: echochat
+      name: dsh-echochat-plugin
+      config:
+        # 走引擎自己的 ctx.llm，不需要 API key。
+        # 默认是本机实测到的 app 账号路由；换设备可改，或留空由工具自动挑。
+        provider: deepseek-account
+        model: deepseek-flash
+        tau: 0.6
+        maxTokens: 900
