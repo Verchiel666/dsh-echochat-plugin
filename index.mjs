@@ -10,7 +10,9 @@ export const config = {
   model: 'deepseek-flash',
   tau: 0.6,
   maxTokens: 900,
-  timeoutMs: 90_000,
+  timeoutMs: 180_000,
+  samples: 2,
+  tieMargin: 0.05,
 }
 
 const RUBRIC = `你是共情对话评审。按 EchoChat 的四段结构评审候选回应。
@@ -146,69 +148,121 @@ export async function collectText(stream) {
  * 纯逻辑主体：给定 llmCall(provider, model, prompt) -> Promise<string>，跑完整流程。
  * 单独抽出来是为了让 L1 测试能注入假 judge，不需要真模型。
  */
-export async function scoreCandidates({ user, candidates, tau = 0.6, llmCall, provider, model, onNote }) {
+/** 多次采样聚合：各段取中位数，audio 取多数；展示用的轨迹取最接近中位数的那次。 */
+export function aggregateJudges(list) {
+  const median = (xs) => {
+    const a = [...xs].sort((x, y) => x - y)
+    const m = Math.floor(a.length / 2)
+    return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2
+  }
+  const s = [0, 1, 2].map((k) => median(list.map((e) => e.scores.s[k])))
+  const content = median(list.map((e) => e.scores.content))
+  const audio = list.filter((e) => e.scores.audio === 1).length * 2 >= list.length ? 1 : 0
+  const target = [...s, content]
+  let best = list[0], bestD = Infinity
+  for (const e of list) {
+    const v = [...e.scores.s, e.scores.content]
+    const d = v.reduce((acc, x, i) => acc + Math.abs(x - target[i]), 0)
+    if (d < bestD) { bestD = d; best = e }
+  }
+  return { scores: { ...best.scores, s, content, audio }, trace: best.trace }
+}
+
+/**
+ * 纯逻辑主体：给定 llmCall(provider, model, prompt) -> Promise<string>，跑完整流程。
+ * samples > 1 时每条候选重复采样并取中位数——真机实测：单次采样会让两个近分候选的胜负在轮次之间翻转。
+ */
+export async function scoreCandidates({ user, candidates, tau = 0.6, llmCall, provider, model, samples = 1, tieMargin = 0.05, onNote }) {
   const note = onNote ?? (() => {})
+  const K = Math.max(1, Math.min(5, Number(samples) || 1))
   const judged = []
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i]
-    let entry = { id: `C${i + 1}`, candidate: cand }
-    try {
-      let text = await llmCall(provider, model, buildJudgePrompt(user, cand))
-      let norm = normalizeJudge(extractJson(text), text)
-      if (!norm.ok) {
-        note(`C${i + 1} 首次输出不合规（${norm.reason}），重试一次`)
-        text = await llmCall(provider, model, `${buildJudgePrompt(user, cand)}\n\n只输出 JSON，不要任何其他字符。scores.s 必须是长度为 3 的数组，例如 "s":[4,4,5]。`)
-        norm = normalizeJudge(extractJson(text), text)
-      }
-      if (!norm.ok) { entry.judgeError = norm.reason }
-      else { entry.scores = norm.scores; entry.trace = norm.trace }
-    } catch (e) {
-      entry.judgeError = e?.message ?? String(e)
+    const entry = { id: `C${i + 1}`, candidate: cand }
+    const oks = []
+    let lastErr
+    for (let k = 0; k < K; k++) {
+      try {
+        let text = await llmCall(provider, model, buildJudgePrompt(user, cand))
+        let norm = normalizeJudge(extractJson(text), text)
+        if (!norm.ok) {
+          note(`C${i + 1} 第 ${k + 1} 次采样不合规（${norm.reason}），重试一次`)
+          text = await llmCall(provider, model, `${buildJudgePrompt(user, cand)}\n\n只输出 JSON，不要任何其他字符。scores.s 必须是长度为 3 的数组，例如 "s":[4,4,5]。`)
+          norm = normalizeJudge(extractJson(text), text)
+        }
+        if (norm.ok) oks.push(norm)
+        else lastErr = norm.reason
+      } catch (e) { lastErr = e?.message ?? String(e) }
+    }
+    if (!oks.length) entry.judgeError = lastErr ?? '评审失败'
+    else {
+      const agg = aggregateJudges(oks)
+      entry.scores = agg.scores
+      entry.trace = agg.trace
+      entry.samples = oks.length
     }
     judged.push(entry)
   }
+
   const usable = judged.filter((j) => j.scores)
   if (usable.length === 0) return { judged, table: [], winner: undefined, skipped: judged.length }
-  if (usable.length === 1) {
-    const only = usable[0]
-    const rr = reasoningReward(only.scores.s, { tau })
-    const rp = responseReward(only.scores)
-    return {
-      judged,
-      table: [{ id: only.id, s: only.scores.s, Rreas: rr.Rreas, gates: rr.g, rresp: rp.rresp,
-                Rtotal: totalReward({ Rreas: rr.Rreas, rresp: rp.rresp, rfmt: rp.rfmt }), A: [0, 0, 0, 0],
-                rootCause: rr.g[0] && rr.g[1] ? '单候选，无组内对照' : (rr.g[0] ? '心智状态推理' : '感知'),
-                repair: '只有一个可用候选，无法做组内相对比较；再给一条对照才能定位' }],
-      winner: only.id, single: true,
-    }
-  }
-  const list = usable.map((u) => ({ id: u.id, s: u.scores.s, resp: u.scores }))
-  const { rows } = sdcaAdvantages(list, { tau })
-  const diag = diagnose(list, { tau })
-  const table = usable.map((u, i) => {
+
+  const buildRow = (u) => {
     const rr = reasoningReward(u.scores.s, { tau })
     const rp = responseReward(u.scores)
     return {
       id: u.id, s: u.scores.s, Rreas: rr.Rreas, gates: rr.g, rresp: rp.rresp,
       Rtotal: totalReward({ Rreas: rr.Rreas, rresp: rp.rresp, rfmt: rp.rfmt }),
-      A: rows[i].A, rootCause: diag[i].rootCause, gateFailure: diag[i].gateFailure, repair: diag[i].repair,
+      samples: u.samples,
     }
-  })
-  const winner = [...table].sort((a, b) => b.Rtotal - a.Rtotal)[0].id
-  return { judged, table, winner }
+  }
+
+  if (usable.length === 1) {
+    const only = usable[0]
+    const row = buildRow(only)
+    const rr = reasoningReward(only.scores.s, { tau })
+    return {
+      judged,
+      table: [{ ...row, A: [0, 0, 0, 0],
+        rootCause: rr.g[0] && rr.g[1] ? '单候选，无组内对照' : (rr.g[0] ? '心智状态推理' : '感知'),
+        repair: '只有一个可用候选，无法做组内相对比较；再给一条对照才能定位' }],
+      winner: only.id, single: true,
+    }
+  }
+
+  const list = usable.map((u) => ({ id: u.id, s: u.scores.s, resp: u.scores }))
+  const { rows } = sdcaAdvantages(list, { tau })
+  const diag = diagnose(list, { tau })
+  const table = usable.map((u, i) => ({
+    ...buildRow(u),
+    A: rows[i].A, rootCause: diag[i].rootCause, gateFailure: diag[i].gateFailure, repair: diag[i].repair,
+  }))
+  const ranked = [...table].sort((a, b) => b.Rtotal - a.Rtotal)
+  const top2Gap = ranked[0].Rtotal - ranked[1].Rtotal
+  const tied = top2Gap < tieMargin
+  return {
+    judged, table, winner: ranked[0].id, top2Gap, tied, tieMargin,
+    runnerUp: tied ? ranked[1].id : undefined,
+  }
 }
 
-export function renderReport({ table, judged, winner, tau }) {
+export function renderReport({ table, judged, winner, tau, top2Gap, tied, tieMargin, runnerUp }) {
   const lines = []
-  lines.push(`τ=${tau}　候选 ${judged.length} 个，可用 ${table.length} 个`)
+  const sampled = table[0] && table[0].samples ? `　每条采样 ${table[0].samples} 次取中位数` : ''
+  lines.push(`τ=${tau}　候选 ${judged.length} 个，可用 ${table.length} 个${sampled}`)
   lines.push('')
   lines.push('id  [感知 推理 策略]  R_reas  门控  R_resp  R_total | A(4段)              | 最弱环节')
+  const fmt = (x, w = 5, d = 2) => x.toFixed(d).padStart(w)
   for (const t of table) {
-    const fmt = (x, w = 5, d = 2) => x.toFixed(d).padStart(w)
     lines.push(`${t.id.padEnd(3)} ${t.s.map((x) => String(x).padStart(4)).join(' ')} | ${fmt(t.Rreas, 6, 3)} ${t.gates.join('').padStart(5)} ${fmt(t.rresp, 6, 3)} ${fmt(t.Rtotal, 7, 3)} | ${t.A.map((x) => fmt(x)).join(' ')} | ${t.rootCause ? (t.gateFailure ? '✗ ' : '') + t.rootCause : '全达标'}`)
   }
   lines.push('')
-  lines.push(`胜出：${winner}`)
+  if (tied) {
+    lines.push(`⚠ 前两名差距 ${top2Gap.toFixed(3)} < ${tieMargin}：视为并列，**不要**当成确定结论。`)
+    lines.push(`   ${winner} 与 ${runnerUp} 在门控与各段上没有实质差别；要分出高下，把 samples 提到 3-4，或补更细的评分口径。`)
+  } else {
+    lines.push(`胜出：${winner}${top2Gap !== undefined ? `（领先第二名 ${top2Gap.toFixed(3)}）` : ''}`)
+  }
   for (const t of table) lines.push(`  ${t.id}：${t.repair}`)
   const bad = judged.filter((j) => j.judgeError)
   if (bad.length) {
@@ -238,6 +292,8 @@ export function apply(ctx, cfg = {}) {
         },
         scenario: { type: 'string', description: '可选场景说明（模态冲突/自嘲/逞强/情绪漂移等）' },
         tau: { type: 'number', description: '门控阈值，默认 0.6（来自论文）；越高越保守' },
+        samples: { type: 'number', description: '每条候选采样几次取中位数（1-5，默认 2）。单次采样会让近分候选的胜负在轮次间翻转' },
+        tieMargin: { type: 'number', description: '判定并列的阈值，默认 0.05；前两名差距小于它就不宣布胜负' },
         provider: { type: 'string', description: '可选覆盖 LLM provider' },
         model: { type: 'string', description: '可选覆盖模型 id' },
       },
@@ -283,12 +339,15 @@ export function apply(ctx, cfg = {}) {
       }
       const res = await scoreCandidates({
         user: args.scenario ? `${args.user}\n（场景：${args.scenario}）` : args.user,
-        candidates, tau, llmCall, provider, model, onNote: (m) => notes.push(m),
+        candidates, tau, llmCall, provider, model,
+        samples: num(args.samples) ?? c.samples,
+        tieMargin: num(args.tieMargin) ?? c.tieMargin,
+        onNote: (m) => notes.push(m),
       })
       const report = renderReport({ ...res, tau })
       const head = `provider=${provider} model=${model}`
       const body = [head, '', report, notes.length ? `\n注：${notes.join('；')}` : ''].filter(Boolean).join('\n')
-      return { content: [{ type: 'text', text: body }], winner: res.winner, table: res.table }
+      return { content: [{ type: 'text', text: body }], winner: res.winner, tied: res.tied, table: res.table }
     },
   })
   if (typeof ctx.effect === 'function' && typeof off === 'function') ctx.effect(() => off)

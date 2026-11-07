@@ -1,6 +1,6 @@
 // L1：纯逻辑层。用假 judge 注入，不需要真模型。
 import assert from 'node:assert/strict'
-import { pickProvider, extractJson, normalizeJudge, buildJudgePrompt, collectText, scoreCandidates, renderReport } from '../index.mjs'
+import { aggregateJudges, pickProvider, extractJson, normalizeJudge, buildJudgePrompt, collectText, scoreCandidates, renderReport } from '../index.mjs'
 
 let pass = 0, fail = 0
 const t = async (name, fn) => {
@@ -158,6 +158,39 @@ await t('normalizeJudge：真不合规时错误信息带原始输出片段', () 
   assert.equal(n.ok, false)
   assert.ok(n.reason.includes('原始输出'), n.reason)
   assert.ok(n.reason.includes('模型说了一堆废话'), n.reason)
+})
+
+await t('aggregateJudges：取中位数（偶数样本取中间两数均值）', () => {
+  const mk = (s, content = 4) => ({ scores: { s, content, audio: 1 }, trace: { perception: 'p' } })
+  const agg = aggregateJudges([mk([2, 2, 2]), mk([4, 4, 4])])
+  assert.deepEqual(agg.scores.s, [3, 3, 3])
+  const agg2 = aggregateJudges([mk([1, 1, 1]), mk([5, 5, 5]), mk([5, 5, 5])])
+  assert.deepEqual(agg2.scores.s, [5, 5, 5])
+})
+await t('aggregateJudges：audio 取多数', () => {
+  const mk = (audio) => ({ scores: { s: [4, 4, 4], content: 4, audio }, trace: {} })
+  assert.equal(aggregateJudges([mk(1), mk(0), mk(1)]).scores.audio, 1)
+  assert.equal(aggregateJudges([mk(0), mk(1), mk(0)]).scores.audio, 0)
+})
+await t('samples=2：两次采样不一致时按中位数落定', async () => {
+  let n = 0
+  const wobble = async () => { n++; return n % 2 ? J([2, 2, 2], 4) : J([4, 4, 4], 4) }
+  const r = await scoreCandidates({ user: 'u', candidates: ['x', 'y'], samples: 2, llmCall: wobble })
+  assert.deepEqual(r.table[0].s, [3, 3, 3])
+  assert.equal(r.table[0].samples, 2)
+})
+await t('近分并列：不宣布胜负，改为警示', async () => {
+  const same = async () => J([5, 5, 5], 5)
+  const r = await scoreCandidates({ user: 'u', candidates: ['a', 'b'], llmCall: same, tieMargin: 0.05 })
+  assert.equal(r.tied, true)
+  const txt = renderReport({ ...r, tau: 0.6 })
+  assert.ok(txt.includes('⚠ 前两名差距'), txt)
+  assert.ok(!txt.includes('胜出：'), '并列时不该出现"胜出"')
+})
+await t('差距够大时正常宣布胜出并给领先值', async () => {
+  const r = await scoreCandidates({ ...base, tau: 0.6, tieMargin: 0.05 })
+  const txt = renderReport({ ...r, tau: 0.6 })
+  assert.ok(txt.includes('胜出：C3（领先第二名'), txt)
 })
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`)

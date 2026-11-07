@@ -1,6 +1,6 @@
 {
   "name": "dsh-echochat-plugin",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 工具 echo_judge：用 EchoChat 的级联门控 + 步骤级信用分配(SDCA) 给共情回应候选排序并定位该重做哪一步；打分走引擎自己的 ctx.llm，不需要 API key",
   "type": "module",
   "main": "index.mjs",
