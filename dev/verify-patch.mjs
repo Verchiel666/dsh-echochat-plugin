@@ -64,6 +64,17 @@ await t('包名应小于 npm 长度上限 214', () => {
   if (pkg.name.length > 214) throw new Error('包名过长')
 })
 
+await t('包内 patch 的数值配置不能与模块默认值漂移（曾差点用 900 覆盖掉 2000）', async () => {
+  const mod = await import(pathToFileURL(path.join(root, 'index.mjs')).href)
+  const drift = []
+  for (const k of ['tau', 'maxTokens', 'samples', 'tieMargin']) {
+    if (entry.config && k in entry.config && mod.config && k in mod.config && entry.config[k] !== mod.config[k]) {
+      drift.push(`${k}: patch=${entry.config[k]} vs 模块=${mod.config[k]}`)
+    }
+  }
+  if (drift.length) throw new Error('配置漂移 ' + drift.join('；'))
+})
+
 console.log('— ② deploy/cordis.patch.snippet.yml（手工路线）—')
 const snip = load(fs.readFileSync(path.join(root, 'deploy', 'cordis.patch.snippet.yml'), 'utf8'))
 const snipEntry = snip?.[0]?.insert?.[0]

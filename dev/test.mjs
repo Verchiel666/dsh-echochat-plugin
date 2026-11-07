@@ -1,6 +1,6 @@
 // L1：纯逻辑层。用假 judge 注入，不需要真模型。
 import assert from 'node:assert/strict'
-import { aggregateJudges, pickProvider, extractJson, normalizeJudge, buildJudgePrompt, collectText, scoreCandidates, renderReport } from '../index.mjs'
+import { salvageScores, aggregateJudges, pickProvider, extractJson, normalizeJudge, buildJudgePrompt, collectText, scoreCandidates, renderReport } from '../index.mjs'
 
 let pass = 0, fail = 0
 const t = async (name, fn) => {
@@ -191,6 +191,58 @@ await t('差距够大时正常宣布胜出并给领先值', async () => {
   const r = await scoreCandidates({ ...base, tau: 0.6, tieMargin: 0.05 })
   const txt = renderReport({ ...r, tau: 0.6 })
   assert.ok(txt.includes('胜出：C3（领先第二名'), txt)
+})
+
+await t('salvageScores：从截断的 JSON 里抢救分数', () => {
+  const trunc = '{"scores":{"s":[4,3.5,5],"content":4,"audio":1},"trace":{"perception":"它假设用户只是普通担心…'
+  assert.equal(extractJson(trunc), undefined, '前提：这不是合法 JSON')
+  const n = normalizeJudge(undefined, trunc)
+  assert.equal(n.ok, true)
+  assert.deepEqual(n.scores.s, [4, 3.5, 5])
+  assert.equal(n.scores.content, 4)
+  assert.equal(n.salvaged, true)
+  assert.equal(n.scores.format, false, '抢救出来的应标记 format=false')
+})
+await t('normalizeJudge：合法 JSON 优先，不走抢救', () => {
+  const n = normalizeJudge(JSON.parse(J([4, 4, 4], 4)), J([4, 4, 4], 4))
+  assert.equal(n.salvaged, false)
+})
+await t('salvageScores：三段分数没写完就截断 -> 不抢救（不猜）', () => {
+  assert.equal(normalizeJudge(undefined, '{"scores":{"s":[4,3.5,').ok, false)
+})
+await t('renderReport：表头显示配置的采样次数', async () => {
+  const r = await scoreCandidates({ ...base, samples: 2, llmCall: fakeLlm })
+  const txt = renderReport({ ...r, tau: 0.6 })
+  assert.ok(txt.includes('每条采样 2 次取中位数'), txt.split('\n')[0])
+})
+await t('renderReport：采样不足时点名', async () => {
+  // A 只在第 2 次调用（s1 的重试）成功，其余全胡写 -> 成功 1 次 < K=2
+  let n = 0
+  const partial = async (_p, _m, prompt) => {
+    if (prompt.includes('A-温暖空')) { n++; return n === 2 ? J([2, 4, 4], 4) : '胡写' }
+    return fakeLlm(_p, _m, prompt)
+  }
+  const r = await scoreCandidates({ ...base, samples: 2, llmCall: partial })
+  const txt = renderReport({ ...r, tau: 0.6 })
+  assert.ok(txt.includes('采样不足'), txt)
+})
+
+await t('截断也能直接用：scores 放最前，不再触发重试', async () => {
+  let calls = 0
+  const truncated = async (_p, _m, prompt) => {
+    calls++
+    const pick = prompt.includes('C-依据对且贴') ? [5, 5, 5, 5] : prompt.includes('B-') ? [4, 3, 3, 3] : [2, 4, 4, 4]
+    // 模拟被 maxTokens 砍断：JSON 没有闭合，trace 只写了一半
+    return `{"scores":{"s":[${pick[0]},${pick[1]},${pick[2]}],"content":${pick[3]},"audio":1},"trace":{"perception":"它假设用户只是普`
+  }
+  const notes = []
+  const r = await scoreCandidates({
+    user: 'u', candidates: ['A-温暖空', 'B-依据对但空', 'C-依据对且贴'], llmCall: truncated,
+    onNote: (m) => notes.push(m),
+  })
+  assert.equal(r.table.length, 3, '三条都应可用')
+  assert.equal(r.winner, 'C3')
+  assert.equal(notes.length, 0, '不该出现重试提示，实际：' + notes.join(';'))
 })
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`)

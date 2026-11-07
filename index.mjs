@@ -9,7 +9,7 @@ export const config = {
   provider: 'deepseek-account',
   model: 'deepseek-flash',
   tau: 0.6,
-  maxTokens: 900,
+  maxTokens: 2000,
   timeoutMs: 180_000,
   samples: 2,
   tieMargin: 0.05,
@@ -30,8 +30,9 @@ const RUBRIC = `你是共情对话评审。按 EchoChat 的四段结构评审候
    - content：回应内容本身的共情质量（空洞的暖话 → 低分）
    - audio：1 表示语气与用户状态匹配，0 表示不匹配（纯文本场景按文字语气判断）
 
-只输出一个 JSON 对象，不要代码块、不要解释：
-{"trace":{"perception":"","mental_state":"","strategy":""},"scores":{"s":[0,0,0],"content":0,"audio":1}}`
+只输出一个 JSON 对象，不要代码块、不要解释，**scores 必须放在最前面**（输出被长度限制截断时，分数优先保住）：
+{"scores":{"s":[0,0,0],"content":0,"audio":1},"trace":{"perception":"","mental_state":"","strategy":""}}
+trace 三项每项不超过 40 字；scores.s 必须是长度为 3 的数组。`
 
 /** 从模型输出里抠出第一个完整 JSON 对象（容忍代码块与前后废话）。 */
 export function extractJson(text) {
@@ -79,39 +80,65 @@ const excerpt = (t) => (typeof t === 'string' ? t.replace(/\s+/g, ' ').slice(0, 
  *  - 三段分可以是 [a,b,c]、"a,b,c"、或 perception/mental_state/strategy 三个扁平键
  *  - 分数可以是数字字符串；audio 可以是 true/false
  */
-export function normalizeJudge(raw, rawText) {
-  const j = raw ?? {}
-  const sc = j.scores ?? j.score ?? j
-  const pick = (...cands) => { for (const c of cands) { const v = toNum(c); if (v !== undefined) return v } return undefined }
+/** 截断兜底：从半截 JSON 里用正则抢救分数（真机实测 maxTokens 截断是主要失败模式）。 */
+export function salvageScores(text) {
+  if (typeof text !== 'string' || !text) return undefined
+  const sm = text.match(/"s"\s*:\s*\[\s*(-?[0-9.]+)\s*,\s*(-?[0-9.]+)\s*,\s*(-?[0-9.]+)/)
+  const cm = text.match(/"content"\s*:\s*(-?[0-9.]+)/)
+  if (!sm || !cm) return undefined
+  const am = text.match(/"audio"\s*:\s*(true|false|1|0)/)
+  return {
+    scores: {
+      s: [Number(sm[1]), Number(sm[2]), Number(sm[3])],
+      content: Number(cm[1]),
+      audio: am && (am[1] === 'true' || am[1] === '1') ? 1 : am ? 0 : 1,
+    },
+    salvaged: true,
+  }
+}
 
-  let s = []
-  for (const a of [sc && sc.s, sc && sc.stages, sc && sc.stage, j.s, j.stages]) {
-    if (Array.isArray(a)) { s = a.map(toNum); break }
-    if (typeof a === 'string') {
-      const parts = a.split(/[,，;；\s]+/).filter(Boolean)
-      if (parts.length === 3) { s = parts.map(toNum); break }
+export function normalizeJudge(raw, rawText) {
+  let j = raw ?? {}
+  const salv = () => salvageScores(rawText)
+  const readScores = (src) => {
+    const sc = (src && (src.scores ?? src.score)) ?? src ?? {}
+    let s = []
+    for (const a of [sc.s, sc.stages, sc.stage, src && src.s, src && src.stages]) {
+      if (Array.isArray(a)) { s = a.map(toNum); break }
+      if (typeof a === 'string') {
+        const parts = a.split(/[,，;；\s]+/).filter(Boolean)
+        if (parts.length === 3) { s = parts.map(toNum); break }
+      }
     }
+    if (s.length !== 3 || s.some((x) => x === undefined)) {
+      s = [
+        toNum(sc.perception ?? sc['感知'] ?? (src && src.perception)),
+        toNum(sc.mental_state ?? sc.mentalState ?? sc['推理'] ?? (src && src.mental_state)),
+        toNum(sc.strategy ?? sc['策略'] ?? (src && src.strategy)),
+      ]
+    }
+    const content = toNum(sc.content ?? sc['共情'] ?? (src && src.content))
+    const rawAudio = sc.audio !== undefined ? sc.audio : (src && src.audio)
+    return { s, content, audio: toNum(rawAudio) === 1 ? 1 : 0 }
   }
-  if (s.length !== 3 || s.some((x) => x === undefined)) {
-    s = [
-      pick(sc && sc.perception, sc && sc['感知'], j.perception, j.perception_score, j.s1),
-      pick(sc && sc.mental_state, sc && sc.mentalState, sc && sc['推理'], j.mental_state, j.mentalState, j.s2),
-      pick(sc && sc.strategy, sc && sc['策略'], j.strategy, j.s3),
-    ]
+
+  let got = readScores(j)
+  let salvaged = false
+  if (got.s.length !== 3 || got.s.some((x) => x === undefined) || got.content === undefined) {
+    const sv = salv()
+    if (sv) { got = readScores(sv); salvaged = true }
   }
-  if (s.length !== 3 || s.some((x) => x === undefined)) {
+  if (got.s.length !== 3 || got.s.some((x) => x === undefined)) {
     return { ok: false, reason: '三段分数缺失（原始输出：' + excerpt(rawText ?? JSON.stringify(j)) + '）' }
   }
-  const content = pick(sc && sc.content, sc && sc['共情'], j.content, j.content_score)
-  if (content === undefined) {
+  if (got.content === undefined) {
     return { ok: false, reason: 'content 缺失（原始输出：' + excerpt(rawText ?? JSON.stringify(j)) + '）' }
   }
-  const rawAudio = sc && sc.audio !== undefined ? sc.audio : j.audio
-  const audio = toNum(rawAudio) === 1 ? 1 : 0
-  const t = j.trace ?? {}
+  const t = (j && j.trace) ?? {}
   return {
     ok: true,
-    scores: { s: s.map((x) => clamp(x, 0, 5)), content: clamp(content, 0, 5), audio, format: true },
+    salvaged,
+    scores: { s: got.s.map((x) => clamp(x, 0, 5)), content: clamp(got.content, 0, 5), audio: got.audio, format: !salvaged },
     trace: {
       perception: String(t.perception ?? t['感知'] ?? ''),
       mental_state: String(t.mental_state ?? t.mentalState ?? t['推理'] ?? ''),
@@ -241,14 +268,15 @@ export async function scoreCandidates({ user, candidates, tau = 0.6, llmCall, pr
   const top2Gap = ranked[0].Rtotal - ranked[1].Rtotal
   const tied = top2Gap < tieMargin
   return {
-    judged, table, winner: ranked[0].id, top2Gap, tied, tieMargin,
+    judged, table, winner: ranked[0].id, top2Gap, tied, tieMargin, samplesConfigured: K,
     runnerUp: tied ? ranked[1].id : undefined,
   }
 }
 
-export function renderReport({ table, judged, winner, tau, top2Gap, tied, tieMargin, runnerUp }) {
+export function renderReport({ table, judged, winner, tau, top2Gap, tied, tieMargin, runnerUp, samplesConfigured }) {
   const lines = []
-  const sampled = table[0] && table[0].samples ? `　每条采样 ${table[0].samples} 次取中位数` : ''
+  const k = samplesConfigured ?? (table[0] && table[0].samples) ?? 1
+  const sampled = `　每条采样 ${k} 次取中位数`
   lines.push(`τ=${tau}　候选 ${judged.length} 个，可用 ${table.length} 个${sampled}`)
   lines.push('')
   lines.push('id  [感知 推理 策略]  R_reas  门控  R_resp  R_total | A(4段)              | 最弱环节')
@@ -264,6 +292,11 @@ export function renderReport({ table, judged, winner, tau, top2Gap, tied, tieMar
     lines.push(`胜出：${winner}${top2Gap !== undefined ? `（领先第二名 ${top2Gap.toFixed(3)}）` : ''}`)
   }
   for (const t of table) lines.push(`  ${t.id}：${t.repair}`)
+  const thin = judged.filter((j) => j.scores && k > 1 && j.samples && j.samples < k)
+  if (thin.length) {
+    lines.push('')
+    lines.push(`采样不足（配置 ${k} 次，实际更少；结论稳定性下降）：` + thin.map((b) => `${b.id} ${b.samples}/${k}`).join('、'))
+  }
   const bad = judged.filter((j) => j.judgeError)
   if (bad.length) {
     lines.push('')

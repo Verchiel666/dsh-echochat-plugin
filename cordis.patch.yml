@@ -9,4 +9,9 @@
         provider: deepseek-account
         model: deepseek-flash
         tau: 0.6
-        maxTokens: 900
+        # 900 不够：judge 的 reasoning + trace 会把 JSON 截断（真机实测三轮全在重试）
+        maxTokens: 2000
+        # 每条候选采样几次取中位数。单次采样会让近分候选的胜负在轮次间翻转
+        samples: 2
+        # 前两名差距小于它就宣布并列，不硬选
+        tieMargin: 0.05
