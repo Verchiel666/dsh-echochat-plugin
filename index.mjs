@@ -62,25 +62,58 @@ export function pickProvider({ wanted, available }) {
 }
 
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x))
-const num = (x) => (typeof x === 'number' && Number.isFinite(x) ? x : undefined)
+const toNum = (x) => {
+  if (typeof x === 'number' && Number.isFinite(x)) return x
+  if (typeof x === 'boolean') return x ? 1 : 0
+  if (typeof x === 'string' && x.trim() !== '') { const v = Number(x.trim()); if (Number.isFinite(v)) return v }
+  return undefined
+}
+const num = toNum // 兼容旧调用点（execute 里的 args.tau）
+const excerpt = (t) => (typeof t === 'string' ? t.replace(/\s+/g, ' ').slice(0, 120) : String(t ?? '').slice(0, 120))
 
-/** 把 judge 原始输出规范成 rollouts 需要的形状；缺失即判该候选"评审失败"。 */
-export function normalizeJudge(raw) {
+/**
+ * 把 judge 原始输出规范成 rollouts 需要的形状。
+ * 宽容三件事（2026-11-07 真机实测：3/3 候选首轮判"不合规"，查下来是形状差异不是分数错）：
+ *  - 三段分可以是 [a,b,c]、"a,b,c"、或 perception/mental_state/strategy 三个扁平键
+ *  - 分数可以是数字字符串；audio 可以是 true/false
+ */
+export function normalizeJudge(raw, rawText) {
   const j = raw ?? {}
-  const sc = j.scores ?? {}
-  const s = Array.isArray(sc.s) ? sc.s.map(num) : []
-  if (s.length !== 3 || s.some((x) => x === undefined)) return { ok: false, reason: 'scores.s 缺失或非三个数' }
-  const content = num(sc.content)
-  if (content === undefined) return { ok: false, reason: 'scores.content 缺失' }
-  const audio = num(sc.audio) === 1 ? 1 : 0
+  const sc = j.scores ?? j.score ?? j
+  const pick = (...cands) => { for (const c of cands) { const v = toNum(c); if (v !== undefined) return v } return undefined }
+
+  let s = []
+  for (const a of [sc && sc.s, sc && sc.stages, sc && sc.stage, j.s, j.stages]) {
+    if (Array.isArray(a)) { s = a.map(toNum); break }
+    if (typeof a === 'string') {
+      const parts = a.split(/[,，;；\s]+/).filter(Boolean)
+      if (parts.length === 3) { s = parts.map(toNum); break }
+    }
+  }
+  if (s.length !== 3 || s.some((x) => x === undefined)) {
+    s = [
+      pick(sc && sc.perception, sc && sc['感知'], j.perception, j.perception_score, j.s1),
+      pick(sc && sc.mental_state, sc && sc.mentalState, sc && sc['推理'], j.mental_state, j.mentalState, j.s2),
+      pick(sc && sc.strategy, sc && sc['策略'], j.strategy, j.s3),
+    ]
+  }
+  if (s.length !== 3 || s.some((x) => x === undefined)) {
+    return { ok: false, reason: '三段分数缺失（原始输出：' + excerpt(rawText ?? JSON.stringify(j)) + '）' }
+  }
+  const content = pick(sc && sc.content, sc && sc['共情'], j.content, j.content_score)
+  if (content === undefined) {
+    return { ok: false, reason: 'content 缺失（原始输出：' + excerpt(rawText ?? JSON.stringify(j)) + '）' }
+  }
+  const rawAudio = sc && sc.audio !== undefined ? sc.audio : j.audio
+  const audio = toNum(rawAudio) === 1 ? 1 : 0
   const t = j.trace ?? {}
   return {
     ok: true,
     scores: { s: s.map((x) => clamp(x, 0, 5)), content: clamp(content, 0, 5), audio, format: true },
     trace: {
-      perception: String(t.perception ?? ''),
-      mental_state: String(t.mental_state ?? ''),
-      strategy: String(t.strategy ?? ''),
+      perception: String(t.perception ?? t['感知'] ?? ''),
+      mental_state: String(t.mental_state ?? t.mentalState ?? t['推理'] ?? ''),
+      strategy: String(t.strategy ?? t['策略'] ?? ''),
     },
   }
 }
@@ -121,11 +154,11 @@ export async function scoreCandidates({ user, candidates, tau = 0.6, llmCall, pr
     let entry = { id: `C${i + 1}`, candidate: cand }
     try {
       let text = await llmCall(provider, model, buildJudgePrompt(user, cand))
-      let norm = normalizeJudge(extractJson(text))
+      let norm = normalizeJudge(extractJson(text), text)
       if (!norm.ok) {
         note(`C${i + 1} 首次输出不合规（${norm.reason}），重试一次`)
-        text = await llmCall(provider, model, `${buildJudgePrompt(user, cand)}\n\n只输出 JSON，不要任何其他字符。`)
-        norm = normalizeJudge(extractJson(text))
+        text = await llmCall(provider, model, `${buildJudgePrompt(user, cand)}\n\n只输出 JSON，不要任何其他字符。scores.s 必须是长度为 3 的数组，例如 "s":[4,4,5]。`)
+        norm = normalizeJudge(extractJson(text), text)
       }
       if (!norm.ok) { entry.judgeError = norm.reason }
       else { entry.scores = norm.scores; entry.trace = norm.trace }

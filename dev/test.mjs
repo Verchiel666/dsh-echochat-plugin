@@ -40,8 +40,12 @@ await t('normalizeJudge：越界分数被夹到 [0,5]', () => {
 await t('normalizeJudge：缺 s 判失败', () => {
   assert.equal(normalizeJudge({ scores: { content: 4 } }).ok, false)
 })
-await t('normalizeJudge：audio 非数字按 0', () => {
-  assert.equal(normalizeJudge(JSON.parse(J([4, 4, 4], 4, '1'))).scores.audio, 0)
+await t('normalizeJudge：audio 写成字符串 "1" 按 1（宽容）', () => {
+  assert.equal(normalizeJudge(JSON.parse(J([4, 4, 4], 4, '1'))).scores.audio, 1)
+})
+await t('normalizeJudge：audio 写 true 按 1、写瞎话按 0', () => {
+  assert.equal(normalizeJudge({ scores: { s: [4, 4, 4], content: 4, audio: true } }).scores.audio, 1)
+  assert.equal(normalizeJudge({ scores: { s: [4, 4, 4], content: 4, audio: '应该算匹配吧' } }).scores.audio, 0)
 })
 await t('buildJudgePrompt：含线索与候选', () => {
   const p = buildJudgePrompt('我没事（声音发紧）', '一切都会好起来的')
@@ -128,6 +132,32 @@ await t('pickProvider：没有 deepseek 就用第一个', () => {
 })
 await t('pickProvider：注册表为空时保留原值', () => {
   assert.equal(pickProvider({ wanted: 'deepseek-account', available: [] }), 'deepseek-account')
+})
+
+await t('normalizeJudge：扁平键（perception/mental_state/strategy）', () => {
+  const n = normalizeJudge({ scores: { perception: 5, mental_state: 4.5, strategy: 4.5, content: 4, audio: 1 } })
+  assert.equal(n.ok, true)
+  assert.deepEqual(n.scores.s, [5, 4.5, 4.5])
+})
+await t('normalizeJudge：s 是逗号字符串', () => {
+  const n = normalizeJudge({ scores: { s: '4, 4.5, 5', content: '4' } })
+  assert.deepEqual(n.scores.s, [4, 4.5, 5])
+  assert.equal(n.scores.content, 4)
+})
+await t('normalizeJudge：分数写成字符串 + audio 布尔', () => {
+  const n = normalizeJudge({ scores: { s: ['5', '5', '5'], content: '5', audio: true } })
+  assert.deepEqual(n.scores.s, [5, 5, 5])
+  assert.equal(n.scores.audio, 1)
+})
+await t('normalizeJudge：完全没有 scores 外层包装也能读', () => {
+  const n = normalizeJudge({ perception: 2, mental_state: 4, strategy: 4, content: 4, audio: 0 })
+  assert.deepEqual(n.scores.s, [2, 4, 4])
+})
+await t('normalizeJudge：真不合规时错误信息带原始输出片段', () => {
+  const n = normalizeJudge({ foo: 1 }, '模型说了一堆废话 scores={} 完')
+  assert.equal(n.ok, false)
+  assert.ok(n.reason.includes('原始输出'), n.reason)
+  assert.ok(n.reason.includes('模型说了一堆废话'), n.reason)
 })
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'}  ${pass} passed, ${fail} failed`)
